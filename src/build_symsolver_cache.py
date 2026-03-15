@@ -41,14 +41,14 @@ def _iter_pathways(pathway):
 def main():
     args = _parse_args()
 
-    for pathway_opt in _iter_pathways(args.pathway):
-        target_path = get_symsolver_c3c4_cache_path(pathway_opt)
-        print(f"[build] {pathway_opt}")
+    for pathway_option in _iter_pathways(args.pathway):
+        target_path = get_symsolver_c3c4_cache_path(pathway_option)
+        print(f"[build] {pathway_option}")
         print(f"[cache] {target_path}")
 
         try:
             cache_path = build_symsolver_c3c4_cache(
-                pathway_opt,
+                pathway_option,
                 overwrite=args.overwrite,
             )
         except FileExistsError:

@@ -1,471 +1,272 @@
+from types import SimpleNamespace
+
 import numpy as np
 
-from .loadvars_fun import loadvars_fun
-from .workspace2struct_fun import workspace2struct_fun
+
+def _field_any(v, *names):
+    if isinstance(v, dict):
+        for name in names:
+            if name in v:
+                return v[name]
+    else:
+        for name in names:
+            if hasattr(v, name):
+                return getattr(v, name)
+
+    raise AttributeError(f"Missing required field. Tried: {names!r}")
 
 
-def _strcmp(pathway_opt, target):
-    if isinstance(pathway_opt, (list, tuple)) and len(pathway_opt) == 1:
-        pathway_opt = pathway_opt[0]
-    return pathway_opt == target
+def _normalize_pathway_option(pathway_option):
+    if isinstance(pathway_option, (list, tuple)) and len(pathway_option) == 1:
+        return pathway_option[0]
+    return pathway_option
 
 
-def _matlab_truth(value):
+def _all_true(value):
     value = np.asarray(value)
     return value.size != 0 and bool(np.all(value))
 
 
-def _min_with_index(values):
-    arrays = np.broadcast_arrays(*[np.asarray(value, dtype=float) for value in values])
-    stacked = np.stack(arrays, axis=-1)
-    return np.min(stacked, axis=-1), np.argmin(stacked, axis=-1) + 1
+_MODEL_OUTPUT_EXCLUDE = {
+    "v",
+    "Absorptance",
+    "Cytbf_density",
+    "Rubisco_density",
+    "Resp_scalar",
+    "k_F",
+    "k_D",
+    "k_P1",
+    "k_N1",
+    "k_P2",
+    "k_U2",
+    "k_q",
+    "ATP_e_ratio_linear",
+    "ATP_e_ratio_cyclic",
+    "k_cat_CO2",
+    "k_cat_O2",
+    "K_m_CO2",
+    "K_m_O2",
+    "solve_C3C4_cc",
+    "solve_C3C4_cj",
+    "solve_C3C4_jc",
+    "solve_C3C4_jj",
+    "solve_C4_cc",
+    "solve_C4_cj",
+    "solve_C4_jc",
+    "solve_C4_jj",
+    "epsilon_PSI",
+    "epsilon_PSII",
+}
+
+
+def build_model_output(values, exclude=None):
+    exclude_names = set(_MODEL_OUTPUT_EXCLUDE)
+    if exclude is not None:
+        exclude_names.update(exclude)
+
+    workspace = {
+        name: value
+        for name, value in values.items()
+        if name not in exclude_names
+    }
+    return SimpleNamespace(**workspace)
+
+
+def compute_fluorescence_outputs(state):
+    state = dict(state)
+
+    Cytbf_density_m = state["Cytbf_density"] * (1 - state["Cytbf_fraction_s"])
+    Rubisco_density_m = state["Rubisco_density"] * (1 - state["Rubisco_fraction_s"])
+    Cytbf_active_m_actual = state["J_PSI_m_j"] / state["k_q"]
+    phi_P1_m_actual = state["J_PSI_m_actual"] / (state["PPFD"] * state["a_PSI_m"])
+    q_P1_m_actual = phi_P1_m_actual * ((state["k_P1"] + state["k_D"] + state["k_F"]) / state["k_P1"])
+    phi_P2_m_actual = state["J_PSII_m_actual"] / (state["PPFD"] * state["a_PSII_m"])
+    q_P2_m_actual = 1 - Cytbf_active_m_actual / Cytbf_density_m
+
+    k_N2_m_actual = (
+        (
+            state["k_P2"] ** 2 * phi_P2_m_actual**2
+            - 2 * state["k_P2"] ** 2 * phi_P2_m_actual * q_P2_m_actual
+            + state["k_P2"] ** 2 * q_P2_m_actual**2
+            - 4 * state["k_P2"] * state["k_U2"] * phi_P2_m_actual**2 * q_P2_m_actual
+            + 2 * state["k_P2"] * state["k_U2"] * phi_P2_m_actual**2
+            + 2 * state["k_P2"] * state["k_U2"] * phi_P2_m_actual * q_P2_m_actual
+            + state["k_U2"] ** 2 * phi_P2_m_actual**2
+        ) ** (1 / 2)
+        - state["k_P2"] * phi_P2_m_actual
+        + state["k_U2"] * phi_P2_m_actual
+        + state["k_P2"] * q_P2_m_actual
+    ) / (2 * phi_P2_m_actual) - state["k_F"] - state["k_U2"] - state["k_D"]
+
+    if _all_true(state["V_p_max_m"] == 0):
+        Cytbf_density_s = 0
+        Rubisco_density_s = 0
+        Cytbf_active_s_actual = 0
+        phi_P1_s_actual = 0
+        q_P1_s_actual = 0
+        phi_P2_s_actual = 0
+        q_P2_s_actual = 0
+        k_N2_s_actual = 0
+
+    if _all_true(state["V_c_max_s"] > 0):
+        Cytbf_density_s = state["Cytbf_density"] * state["Cytbf_fraction_s"]
+        Rubisco_density_s = state["Rubisco_density"] * state["Rubisco_fraction_s"]
+        Cytbf_active_s_actual = state["J_PSI_s_jj"] / state["k_q"]
+        phi_P1_s_actual = state["J_PSI_s_actual"] / (state["PPFD"] * state["a_PSI_s"])
+        q_P1_s_actual = phi_P1_s_actual * ((state["k_P1"] + state["k_D"] + state["k_F"]) / state["k_P1"])
+        phi_P2_s_actual = state["J_PSII_s_actual"] / (state["PPFD"] * state["a_PSII_s"])
+        q_P2_s_actual = 1 - Cytbf_active_s_actual / Cytbf_density_s
+
+        k_N2_s_actual = (
+            (
+                state["k_P2"] ** 2 * phi_P2_s_actual**2
+                - 2 * state["k_P2"] ** 2 * phi_P2_s_actual * q_P2_s_actual
+                + state["k_P2"] ** 2 * q_P2_s_actual**2
+                - 4 * state["k_P2"] * state["k_U2"] * phi_P2_s_actual**2 * q_P2_s_actual
+                + 2 * state["k_P2"] * state["k_U2"] * phi_P2_s_actual**2
+                + 2 * state["k_P2"] * state["k_U2"] * phi_P2_s_actual * q_P2_s_actual
+                + state["k_U2"] ** 2 * phi_P2_s_actual**2
+            ) ** (1 / 2)
+            - state["k_P2"] * phi_P2_s_actual
+            + state["k_U2"] * phi_P2_s_actual
+            + state["k_P2"] * q_P2_s_actual
+        ) / (2 * phi_P2_s_actual) - state["k_F"] - state["k_U2"] - state["k_D"]
+
+    phi_p2_m_actual = q_P2_m_actual * state["k_P2"] / (state["k_P2"] + k_N2_m_actual + state["k_D"] + state["k_F"] + state["k_U2"])
+    phi_n2_m_actual = q_P2_m_actual * k_N2_m_actual / (state["k_P2"] + k_N2_m_actual + state["k_D"] + state["k_F"] + state["k_U2"]) + (1 - q_P2_m_actual) * k_N2_m_actual / (k_N2_m_actual + state["k_D"] + state["k_F"] + state["k_U2"])
+    phi_d2_m_actual = q_P2_m_actual * state["k_D"] / (state["k_P2"] + k_N2_m_actual + state["k_D"] + state["k_F"] + state["k_U2"]) + (1 - q_P2_m_actual) * state["k_D"] / (k_N2_m_actual + state["k_D"] + state["k_F"] + state["k_U2"])
+    phi_f2_m_actual = q_P2_m_actual * state["k_F"] / (state["k_P2"] + k_N2_m_actual + state["k_D"] + state["k_F"] + state["k_U2"]) + (1 - q_P2_m_actual) * state["k_F"] / (k_N2_m_actual + state["k_D"] + state["k_F"] + state["k_U2"])
+    phi_u2_m_actual = q_P2_m_actual * state["k_U2"] / (state["k_P2"] + k_N2_m_actual + state["k_D"] + state["k_F"] + state["k_U2"]) + (1 - q_P2_m_actual) * state["k_U2"] / (k_N2_m_actual + state["k_D"] + state["k_F"] + state["k_U2"])
+    phi_P2_m_actual = phi_p2_m_actual / (1 - phi_u2_m_actual)
+    phi_N2_m_actual = phi_n2_m_actual / (1 - phi_u2_m_actual)
+    phi_D2_m_actual = phi_d2_m_actual / (1 - phi_u2_m_actual)
+    phi_F2_m_actual = phi_f2_m_actual / (1 - phi_u2_m_actual)
+
+    phi_P1_m_actual = q_P1_m_actual * state["k_P1"] / (state["k_P1"] + state["k_D"] + state["k_F"])
+    phi_N1_m_actual = (1 - q_P1_m_actual) * state["k_N1"] / (state["k_N1"] + state["k_D"] + state["k_F"])
+    phi_D1_m_actual = q_P1_m_actual * state["k_D"] / (state["k_P1"] + state["k_D"] + state["k_F"]) + (1 - q_P1_m_actual) * state["k_D"] / (state["k_N1"] + state["k_D"] + state["k_F"])
+    phi_F1_m_actual = q_P1_m_actual * state["k_F"] / (state["k_P1"] + state["k_D"] + state["k_F"]) + (1 - q_P1_m_actual) * state["k_F"] / (state["k_N1"] + state["k_D"] + state["k_F"])
+
+    phi_p2_s_actual = q_P2_s_actual * state["k_P2"] / (state["k_P2"] + k_N2_s_actual + state["k_D"] + state["k_F"] + state["k_U2"])
+    phi_n2_s_actual = q_P2_s_actual * k_N2_s_actual / (state["k_P2"] + k_N2_s_actual + state["k_D"] + state["k_F"] + state["k_U2"]) + (1 - q_P2_s_actual) * k_N2_s_actual / (k_N2_s_actual + state["k_D"] + state["k_F"] + state["k_U2"])
+    phi_d2_s_actual = q_P2_s_actual * state["k_D"] / (state["k_P2"] + k_N2_s_actual + state["k_D"] + state["k_F"] + state["k_U2"]) + (1 - q_P2_s_actual) * state["k_D"] / (k_N2_s_actual + state["k_D"] + state["k_F"] + state["k_U2"])
+    phi_f2_s_actual = q_P2_s_actual * state["k_F"] / (state["k_P2"] + k_N2_s_actual + state["k_D"] + state["k_F"] + state["k_U2"]) + (1 - q_P2_s_actual) * state["k_F"] / (k_N2_s_actual + state["k_D"] + state["k_F"] + state["k_U2"])
+    phi_u2_s_actual = q_P2_s_actual * state["k_U2"] / (state["k_P2"] + k_N2_s_actual + state["k_D"] + state["k_F"] + state["k_U2"]) + (1 - q_P2_s_actual) * state["k_U2"] / (k_N2_s_actual + state["k_D"] + state["k_F"] + state["k_U2"])
+    phi_P2_s_actual = phi_p2_s_actual / (1 - phi_u2_s_actual)
+    phi_N2_s_actual = phi_n2_s_actual / (1 - phi_u2_s_actual)
+    phi_D2_s_actual = phi_d2_s_actual / (1 - phi_u2_s_actual)
+    phi_F2_s_actual = phi_f2_s_actual / (1 - phi_u2_s_actual)
+
+    phi_P1_s_actual = q_P1_s_actual * state["k_P1"] / (state["k_P1"] + state["k_D"] + state["k_F"])
+    phi_N1_s_actual = (1 - q_P1_s_actual) * state["k_N1"] / (state["k_N1"] + state["k_D"] + state["k_F"])
+    phi_D1_s_actual = q_P1_s_actual * state["k_D"] / (state["k_P1"] + state["k_D"] + state["k_F"]) + (1 - q_P1_s_actual) * state["k_D"] / (state["k_N1"] + state["k_D"] + state["k_F"])
+    phi_F1_s_actual = q_P1_s_actual * state["k_F"] / (state["k_P1"] + state["k_D"] + state["k_F"]) + (1 - q_P1_s_actual) * state["k_F"] / (state["k_N1"] + state["k_D"] + state["k_F"])
+
+    F_s_m_actual = state["a_PSII_m"] * phi_F2_m_actual * state["epsilon_PSII"] + state["a_PSI_m"] * phi_F1_m_actual * state["epsilon_PSI"]
+    F_m_m_actual = state["a_PSII_m"] * state["k_F"] / (state["k_D"] + state["k_F"]) * state["epsilon_PSII"] + state["a_PSI_m"] * state["k_F"] / (state["k_N1"] + state["k_D"] + state["k_F"]) * state["epsilon_PSI"]
+    F_o_m_actual = state["a_PSII_m"] * state["k_F"] / (state["k_P2"] + state["k_D"] + state["k_F"]) * state["epsilon_PSII"] + state["a_PSI_m"] * state["k_F"] / (state["k_P1"] + state["k_D"] + state["k_F"]) * state["epsilon_PSI"]
+    F_m_prime_m_actual = state["a_PSII_m"] * state["k_F"] / (k_N2_m_actual + state["k_D"] + state["k_F"]) * state["epsilon_PSII"] + state["a_PSI_m"] * state["k_F"] / (state["k_N1"] + state["k_D"] + state["k_F"]) * state["epsilon_PSI"]
+    F_o_prime_m_actual = state["a_PSII_m"] * state["k_F"] / (state["k_P2"] + k_N2_m_actual + state["k_D"] + state["k_F"]) * state["epsilon_PSII"] + state["a_PSI_m"] * state["k_F"] / (state["k_P1"] + state["k_D"] + state["k_F"]) * state["epsilon_PSI"]
+
+    F_s_s_actual = state["a_PSII_s"] * phi_F2_s_actual * state["epsilon_PSII"] + state["a_PSI_s"] * phi_F1_s_actual * state["epsilon_PSI"]
+    F_m_s_actual = state["a_PSII_s"] * state["k_F"] / (state["k_D"] + state["k_F"]) * state["epsilon_PSII"] + state["a_PSI_s"] * state["k_F"] / (state["k_N1"] + state["k_D"] + state["k_F"]) * state["epsilon_PSI"]
+    F_o_s_actual = state["a_PSII_s"] * state["k_F"] / (state["k_P2"] + state["k_D"] + state["k_F"]) * state["epsilon_PSII"] + state["a_PSI_s"] * state["k_F"] / (state["k_P1"] + state["k_D"] + state["k_F"]) * state["epsilon_PSI"]
+    F_m_prime_s_actual = state["a_PSII_s"] * state["k_F"] / (k_N2_s_actual + state["k_D"] + state["k_F"]) * state["epsilon_PSII"] + state["a_PSI_s"] * state["k_F"] / (state["k_N1"] + state["k_D"] + state["k_F"]) * state["epsilon_PSI"]
+    F_o_prime_s_actual = state["a_PSII_s"] * state["k_F"] / (state["k_P2"] + k_N2_s_actual + state["k_D"] + state["k_F"]) * state["epsilon_PSII"] + state["a_PSI_s"] * state["k_F"] / (state["k_P1"] + state["k_D"] + state["k_F"]) * state["epsilon_PSI"]
+
+    F_s = F_s_m_actual + F_s_s_actual
+    F_m = F_m_m_actual + F_m_s_actual
+    F_o = F_o_m_actual + F_o_s_actual
+    F_m_prime = F_m_prime_m_actual + F_m_prime_s_actual
+    F_o_prime = F_o_prime_m_actual + F_o_prime_s_actual
+
+    qP = (F_m_prime - F_s) / (F_m_prime - F_o_prime)
+    qL = (F_m_prime - F_s) * F_o_prime / ((F_m_prime - F_o_prime) * F_s)
+    NPQ = F_m / F_m_prime - 1
+    Phi_PSII = 1 - F_s / F_m_prime
+    Phi_NPQ = F_s * (1 / F_m_prime - 1 / F_m)
+    Phi_f_d = F_s / F_m
+
+    return {
+        "Cytbf_density_m": Cytbf_density_m,
+        "Rubisco_density_m": Rubisco_density_m,
+        "Cytbf_active_m_actual": Cytbf_active_m_actual,
+        "phi_P1_m_actual": phi_P1_m_actual,
+        "q_P1_m_actual": q_P1_m_actual,
+        "q_P2_m_actual": q_P2_m_actual,
+        "k_N2_m_actual": k_N2_m_actual,
+        "Cytbf_density_s": Cytbf_density_s,
+        "Rubisco_density_s": Rubisco_density_s,
+        "Cytbf_active_s_actual": Cytbf_active_s_actual,
+        "phi_P1_s_actual": phi_P1_s_actual,
+        "q_P1_s_actual": q_P1_s_actual,
+        "phi_P2_s_actual": phi_P2_s_actual,
+        "q_P2_s_actual": q_P2_s_actual,
+        "k_N2_s_actual": k_N2_s_actual,
+        "phi_p2_m_actual": phi_p2_m_actual,
+        "phi_n2_m_actual": phi_n2_m_actual,
+        "phi_d2_m_actual": phi_d2_m_actual,
+        "phi_f2_m_actual": phi_f2_m_actual,
+        "phi_u2_m_actual": phi_u2_m_actual,
+        "phi_P2_m_actual": phi_P2_m_actual,
+        "phi_N2_m_actual": phi_N2_m_actual,
+        "phi_D2_m_actual": phi_D2_m_actual,
+        "phi_F2_m_actual": phi_F2_m_actual,
+        "phi_N1_m_actual": phi_N1_m_actual,
+        "phi_D1_m_actual": phi_D1_m_actual,
+        "phi_F1_m_actual": phi_F1_m_actual,
+        "phi_p2_s_actual": phi_p2_s_actual,
+        "phi_n2_s_actual": phi_n2_s_actual,
+        "phi_d2_s_actual": phi_d2_s_actual,
+        "phi_f2_s_actual": phi_f2_s_actual,
+        "phi_u2_s_actual": phi_u2_s_actual,
+        "phi_P2_s_actual": phi_P2_s_actual,
+        "phi_N2_s_actual": phi_N2_s_actual,
+        "phi_D2_s_actual": phi_D2_s_actual,
+        "phi_F2_s_actual": phi_F2_s_actual,
+        "phi_N1_s_actual": phi_N1_s_actual,
+        "phi_D1_s_actual": phi_D1_s_actual,
+        "phi_F1_s_actual": phi_F1_s_actual,
+        "F_s_m_actual": F_s_m_actual,
+        "F_m_m_actual": F_m_m_actual,
+        "F_o_m_actual": F_o_m_actual,
+        "F_m_prime_m_actual": F_m_prime_m_actual,
+        "F_o_prime_m_actual": F_o_prime_m_actual,
+        "F_s_s_actual": F_s_s_actual,
+        "F_m_s_actual": F_m_s_actual,
+        "F_o_s_actual": F_o_s_actual,
+        "F_m_prime_s_actual": F_m_prime_s_actual,
+        "F_o_prime_s_actual": F_o_prime_s_actual,
+        "F_s": F_s,
+        "F_m": F_m,
+        "F_o": F_o,
+        "F_m_prime": F_m_prime,
+        "F_o_prime": F_o_prime,
+        "qP": qP,
+        "qL": qL,
+        "NPQ": NPQ,
+        "Phi_PSII": Phi_PSII,
+        "Phi_NPQ": Phi_NPQ,
+        "Phi_f_d": Phi_f_d,
+    }
 
 
 def model_fun_c3c4(v):
-    (
-        pathway_opt,
-        Q,
-        T,
-        P,
-        O_m,
-        C_m,
-        Abs,
-        abs_frac,
-        a2_m_frac,
-        a2_s_frac,
-        eps1,
-        eps2,
-        CB6F,
-        vq_frac,
-        RUB,
-        Rdsc,
-        vc_frac,
-        Vpmax,
-        gbs,
-        gbso,
-        Kf,
-        Kd,
-        Kp1,
-        Kn1,
-        Kp2,
-        Ku2,
-        kq,
-        nl,
-        nc,
-        kc,
-        ko,
-        Kc,
-        Ko,
-        Kp,
-        c3c4_solve_cc,
-        c3c4_solve_cj,
-        c3c4_solve_jc,
-        c3c4_solve_jj,
-        c4_solve_cc,
-        c4_solve_cj,
-        c4_solve_jc,
-        c4_solve_jj,
-    ) = loadvars_fun(v)
+    from .model_fun_c3 import model_fun_c3
+    from .model_fun_nadp_me_c4 import model_fun_nadp_me_c4
+    from .model_fun_type_i_c3c4 import model_fun_type_i_c3c4
 
-    Q = np.asarray(Q, dtype=float)
-    T = np.asarray(T, dtype=float)
-    P = np.asarray(P, dtype=float)
-    O_m = np.asarray(O_m, dtype=float)
-    C_m = np.asarray(C_m, dtype=float)
+    pathway_option = _normalize_pathway_option(_field_any(v, "pathway_option", "pathway_opt"))
+    pathway_dispatch = {
+        "C3": model_fun_c3,
+        "Type-I-C3-C4": model_fun_type_i_c3c4,
+        "NADP-ME-C4": model_fun_nadp_me_c4,
+    }
 
-    Abs_m = Abs * (1 - abs_frac)
-    Abs_s = Abs * abs_frac
-    a2_m = Abs_m * a2_m_frac
-    a1_m = Abs_m - a2_m
-    a2_s = Abs_s * a2_s_frac
-    a1_s = Abs_s - a2_s
+    try:
+        pathway_model_fun = pathway_dispatch[pathway_option]
+    except KeyError as exc:
+        supported = ", ".join(sorted(pathway_dispatch))
+        raise ValueError(f"Unsupported pathway_option {pathway_option!r}. Supported pathways: {supported}") from exc
 
-    T_K = T + 273.15
-    Tref_K = 25 + 273.15
-    R = 0.008314
-
-    Ha = 37
-    kq = kq * np.exp(Ha / R * (1 / Tref_K - 1 / T_K))
-    Vqmax = CB6F * kq
-    Vqmax_m = Vqmax * (1 - vq_frac)
-    Vqmax_s = Vqmax * vq_frac
-
-    En = 0.710
-    Hd = 220
-    nl = nl * (1 + np.exp((Tref_K * En - Hd) / (R * Tref_K))) / (
-        1 + np.exp((T_K * En - Hd) / (R * T_K))
-    )
-    nc = nc * (1 + np.exp((Tref_K * En - Hd) / (R * Tref_K))) / (
-        1 + np.exp((T_K * En - Hd) / (R * T_K))
-    )
-
-    Rd = RUB * kc * Rdsc
-    Ha = 66
-    Rd = Rd * np.exp(Ha / R * (1 / Tref_K - 1 / T_K))
-    Rd_m = Rd * (1 - abs_frac)
-    Rd_s = Rd * abs_frac
-
-    S = (kc / Kc) * (Ko / ko)
-    Ha = 23
-    S = 1 / (1 / S * (np.exp(Ha / R * (1 / Tref_K - 1 / T_K))))
-    Ha = 59
-    Kc = Kc * np.exp(Ha / R * (1 / Tref_K - 1 / T_K))
-    Ha = 36
-    Ko = Ko * np.exp(Ha / R * (1 / Tref_K - 1 / T_K))
-    Ha = 58
-    kc = kc * np.exp(Ha / R * (1 / Tref_K - 1 / T_K))
-    Vcmax = RUB * kc
-    Vcmax_m = Vcmax * (1 - vc_frac)
-    Vcmax_s = Vcmax * vc_frac
-
-    Ha = 58
-    Vpmax = Vpmax * np.exp(Ha / R * (1 / Tref_K - 1 / T_K))
-    Vpmax_m = Vpmax
-
-    if _matlab_truth(Vpmax_m == 0):
-        if _strcmp(pathway_opt, "C3") or _strcmp(pathway_opt, "Type-I-C3-C4"):
-            JP700_mj = Q * Vqmax_m / (Q + Vqmax_m / (a1_m * (Kp1 / (Kp1 + Kd + Kf))))
-            JP680_mj = JP700_mj / (
-                1
-                - (nl / nc)
-                + (3 + 7 * O_m / (2 * S * C_m))
-                / ((4 + 4 * O_m / (S * C_m)) * nc)
-            )
-            Vc_mj = JP680_mj / (4 * (1 + O_m / (S * C_m)))
-            Vo_mj = Vc_mj * O_m / (S * C_m)
-            Ag_mj = Vc_mj - Vo_mj / 2
-            An_mj = Ag_mj - Rd_m
-            Vp_mj = 0
-
-            Vc_mc = C_m * Vcmax_m / (C_m + Kc * (1 + O_m / Ko))
-            Vo_mc = Vc_mc * O_m / (S * C_m)
-            Ag_mc = Vc_mc - Vo_mc / 2
-            An_mc = Ag_mc - Rd_m
-            JP680_mc = Ag_mc * 4 * (1 + O_m / (S * C_m)) / (1 - O_m / (2 * S * C_m))
-            JP700_mc = JP680_mc * (
-                1
-                - (nl / nc)
-                + (3 + 7 * O_m / (2 * S * C_m))
-                / ((4 + 4 * O_m / (S * C_m)) * nc)
-            )
-            Vp_mc = 0
-
-            if _matlab_truth(Vcmax_s == 0):
-                Vg_mj = 0
-                Vg_mc = 0
-            else:
-                Vg_mj = Vo_mj / 2
-                Vg_mc = Vo_mc / 2
-
-    if _matlab_truth(Vpmax_m > 0):
-        if _strcmp(pathway_opt, "NADP-ME-C4"):
-            JP700_mj = Q * Vqmax_m / (Q + Vqmax_m / (a1_m * (Kp1 / (Kp1 + Kd + Kf))))
-            JP680_mj = JP700_mj / (1 - (nl / nc) + 1 / nc)
-            Vp_mj = JP680_mj / 2
-
-            Vp_mc = Vpmax_m * C_m / (Kp + C_m)
-            JP680_mc = Vp_mc * 2
-            JP700_mc = JP680_mc * (1 - (nl / nc) + 1 / nc)
-
-            Vc_mj = 0
-            Vo_mj = 0
-            Vg_mj = 0
-            Ag_mj = 0
-            An_mj = -Rd_m
-            Vc_mc = 0
-            Vo_mc = 0
-            Vg_mc = 0
-            Ag_mc = 0
-            An_mc = -Rd_m
-
-    if _matlab_truth(Vcmax_s == 0):
-        JP700_sjj = 0
-        JP680_sjj = 0
-        JP700_sjc = 0
-        JP680_sjc = 0
-        JP700_scc = 0
-        JP680_scc = 0
-        JP700_scj = 0
-        JP680_scj = 0
-        JP700_sj = 0
-        JP680_sj = 0
-        JP700_sc = 0
-        JP680_sc = 0
-        JP700_sa = 0
-        JP680_sa = 0
-        which_JP700_sj = 0
-        which_JP700_sc = 0
-        Ag_sa = 0
-        An_sa = 0
-        C_sa = 0
-        O_sa = 0
-        L_C_sa = 0
-
-    if np.mean(np.asarray(Vcmax_s, dtype=float)) > 0 and np.mean(np.asarray(Vpmax_m, dtype=float)) == 0:
-        JP700_sjj = Q * Vqmax_s / (Q + Vqmax_s / (a1_s * (Kp1 / (Kp1 + Kd + Kf))))
-        An_sjj = c3c4_solve_jj(C_m, JP680_mj, JP700_sjj, O_m, P, Rd_s, S, gbs, gbso, nc, nl)
-        C_sjj = C_m + (
-            (JP680_mj * O_m / (2 * S * C_m) / (4 * (1 + O_m / (S * C_m)))) - An_sjj
-        ) * P / gbs
-        O_sjj = O_m + An_sjj * P / gbso
-        Ag_sjj = An_sjj + Rd_s
-        JP680_sjj = Ag_sjj * 4 * (1 + O_sjj / (S * C_sjj)) / (1 - O_sjj / (2 * S * C_sjj))
-        Vc_sjj = JP680_sjj / (4 * (1 + O_sjj / (S * C_sjj)))
-        Vo_sjj = Vc_sjj * O_sjj / (S * C_sjj)
-
-        An_sjc = c3c4_solve_jc(C_m, JP680_mj, Kc, Ko, O_m, P, Rd_s, S, Vcmax_s, gbs, gbso)
-        C_sjc = C_m + (
-            (JP680_mj * O_m / (2 * S * C_m) / (4 * (1 + O_m / (S * C_m)))) - An_sjc
-        ) * P / gbs
-        O_sjc = O_m + An_sjc * P / gbso
-        Ag_sjc = An_sjc + Rd_s
-        JP680_sjc = Ag_sjc * 4 * (1 + O_sjc / (S * C_sjc)) / (1 - O_sjc / (2 * S * C_sjc))
-        JP700_sjc = JP680_sjc * (
-            1
-            - (nl / nc)
-            + (3 + 7 * O_sjc / (2 * S * C_sjc)) / ((4 + 4 * O_sjc / (S * C_sjc)) * nc)
-        )
-        Vc_sjc = JP680_sjc / (4 * (1 + O_sjc / (S * C_sjc)))
-        Vo_sjc = Vc_sjc * O_sjc / (S * C_sjc)
-
-        JP700_scj = JP700_sjj
-        An_scj = c3c4_solve_cj(C_m, JP700_scj, Kc, Ko, O_m, P, Rd_s, S, Vcmax_m, gbs, gbso, nc, nl)
-        C_scj = C_m + (
-            (Vcmax_m * O_m / (2 * S) / (C_m + Kc * (1 + O_m / Ko))) - An_scj
-        ) * P / gbs
-        O_scj = O_m + An_scj * P / gbso
-        Ag_scj = An_scj + Rd_s
-        JP680_scj = Ag_scj * 4 * (1 + O_scj / (S * C_scj)) / (1 - O_scj / (2 * S * C_scj))
-        Vc_scj = JP680_scj / (4 * (1 + O_scj / (S * C_scj)))
-        Vo_scj = Vc_scj * O_scj / (S * C_scj)
-
-        An_scc = c3c4_solve_cc(C_m, Kc, Ko, O_m, P, Rd_s, S, Vcmax_m, Vcmax_s, gbs, gbso)
-        C_scc = C_m + (
-            (Vcmax_m * O_m / (2 * S) / (C_m + Kc * (1 + O_m / Ko))) - An_scc
-        ) * P / gbs
-        O_scc = O_m + An_scc * P / gbso
-        Ag_scc = An_scc + Rd_s
-        JP680_scc = Ag_scc * 4 * (1 + O_scc / (S * C_scc)) / (1 - O_scc / (2 * S * C_scc))
-        JP700_scc = JP680_scc * (
-            1
-            - (nl / nc)
-            + (3 + 7 * O_scc / (2 * S * C_scc)) / ((4 + 4 * O_scc / (S * C_scc)) * nc)
-        )
-        Vc_scc = JP680_scc / (4 * (1 + O_scc / (S * C_scc)))
-        Vo_scc = Vc_scc * O_scc / (S * C_scc)
-
-    if _matlab_truth(Vpmax_m > 0):
-        if _strcmp(pathway_opt, "NADP-ME-C4"):
-            JP700_sjj = Q * Vqmax_s / (Q + Vqmax_s / (a1_s * (Kp1 / (Kp1 + Kd + Kf))))
-            An_sjj = c4_solve_jj(C_m, JP700_mj, JP700_sjj, O_m, P, Rd_s, S, gbs, gbso, nc, nl)
-            C_sjj = C_m + (Vp_mj - An_sjj) * P / gbs
-            O_sjj = O_m + (An_sjj - Vp_mj / 2) * P / gbso
-            Ag_sjj = An_sjj + Rd_s
-            JP680_sjj = Ag_sjj * 4 * (1 + O_sjj / (S * C_sjj)) / (1 - O_sjj / (2 * S * C_sjj)) - 2 * Vp_mj
-
-            An_sjc = c4_solve_jc(C_m, JP700_mj, Kc, Ko, O_m, P, Rd_s, S, Vcmax_s, gbs, gbso, nc, nl)
-            C_sjc = C_m + (Vp_mj - An_sjc) * P / gbs
-            O_sjc = O_m + (An_sjc - Vp_mj / 2) * P / gbso
-            Ag_sjc = An_sjc + Rd_s
-            JP680_sjc = Ag_sjc * 4 * (1 + O_sjc / (S * C_sjc)) / (1 - O_sjc / (2 * S * C_sjc)) - 2 * Vp_mj
-            JP700_sjc = JP680_sjc * (
-                1
-                - (nl / nc)
-                + (3 + 7 * O_sjc / (2 * S * C_sjc)) / ((4 + 4 * O_sjc / (S * C_sjc)) * nc)
-            ) + (3 + 7 * O_sjc / (2 * S * C_sjc)) / ((4 + 4 * O_sjc / (S * C_sjc)) * nc) * (Vp_mj / 2)
-
-            JP700_scj = Q * Vqmax_s / (Q + Vqmax_s / (a1_s * (Kp1 / (Kp1 + Kd + Kf))))
-            An_scj = c4_solve_cj(C_m, JP700_scj, Kp, O_m, P, Rd_s, S, Vpmax_m, gbs, gbso, nc, nl)
-            C_scj = C_m + (Vp_mc - An_scj) * P / gbs
-            O_scj = O_m + (An_scj - Vp_mc / 2) * P / gbso
-            Ag_scj = An_scj + Rd_s
-            JP680_scj = Ag_scj * 4 * (1 + O_scj / (S * C_scj)) / (1 - O_scj / (2 * S * C_scj)) - 2 * Vp_mc
-
-            An_scc = c4_solve_cc(C_m, Kc, Ko, Kp, O_m, P, Rd_s, S, Vcmax_s, Vpmax_m, gbs, gbso)
-            C_scc = C_m + (Vp_mc - An_scc) * P / gbs
-            O_scc = O_m + (An_scc - Vp_mc / 2) * P / gbso
-            Ag_scc = An_scc + Rd_s
-            JP680_scc = Ag_scc * 4 * (1 + O_scc / (S * C_scc)) / (1 - O_scc / (2 * S * C_scc)) - 2 * Vp_mc
-            JP700_scc = JP680_scc * (
-                1
-                - (nl / nc)
-                + (3 + 7 * O_scc / (2 * S * C_scc)) / ((4 + 4 * O_scc / (S * C_scc)) * nc)
-            ) + (3 + 7 * O_scc / (2 * S * C_scc)) / ((4 + 4 * O_scc / (S * C_scc)) * nc) * (Vp_mc / 2)
-
-    JP700_ma, which_JP700_ma = _min_with_index([JP700_mj, JP700_mc])
-    JP680_ma = JP680_mj * (which_JP700_ma == 1) + JP680_mc * (which_JP700_ma == 2)
-    Vg_ma = Vg_mj * (which_JP700_ma == 1) + Vg_mc * (which_JP700_ma == 2)
-    Vp_ma = Vp_mj * (which_JP700_ma == 1) + Vp_mc * (which_JP700_ma == 2)
-    An_ma = An_mj * (which_JP700_ma == 1) + An_mc * (which_JP700_ma == 2)
-    Ag_ma = An_ma + Rd_m
-
-    if _matlab_truth(Vcmax_s > 0):
-        JP700_sj, which_JP700_sj = _min_with_index([JP700_sjj, JP700_sjc])
-        JP680_sj = JP680_sjj * (which_JP700_sj == 1) + JP680_sjc * (which_JP700_sj == 2)
-        C_sj = C_sjj * (which_JP700_sj == 1) + C_sjc * (which_JP700_sj == 2)
-        O_sj = O_sjj * (which_JP700_sj == 1) + O_sjc * (which_JP700_sj == 2)
-        An_sj = An_sjj * (which_JP700_sj == 1) + An_sjc * (which_JP700_sj == 2)
-
-        JP700_sc, which_JP700_sc = _min_with_index([JP700_scj, JP700_scc])
-        JP680_sc = JP680_scj * (which_JP700_sc == 1) + JP680_scc * (which_JP700_sc == 2)
-        C_sc = C_scj * (which_JP700_sc == 1) + C_scc * (which_JP700_sc == 2)
-        O_sc = O_scj * (which_JP700_sc == 1) + O_scc * (which_JP700_sc == 2)
-        An_sc = An_scj * (which_JP700_sc == 1) + An_scc * (which_JP700_sc == 2)
-
-        JP700_sa = JP700_sj * (which_JP700_ma == 1) + JP700_sc * (which_JP700_ma == 2)
-        JP680_sa = JP680_sj * (which_JP700_ma == 1) + JP680_sc * (which_JP700_ma == 2)
-        C_sa = C_sj * (which_JP700_ma == 1) + C_sc * (which_JP700_ma == 2)
-        O_sa = O_sj * (which_JP700_ma == 1) + O_sc * (which_JP700_ma == 2)
-        An_sa = An_sj * (which_JP700_ma == 1) + An_sc * (which_JP700_ma == 2)
-        L_C_sa = gbs / P * (C_sa - C_m)
-        Ag_sa = An_sa + Rd_s
-
-    JP700_a = JP700_ma + JP700_sa
-    JP680_a = JP680_ma + JP680_sa
-    An_a = An_ma + An_sa
-    Ag_a = An_a + Rd
-
-    CB6F_m = CB6F * (1 - vq_frac)
-    RUB_m = RUB * (1 - vc_frac)
-    CB6F_ma = JP700_mj / kq
-    phi1P_ma = JP700_ma / (Q * a1_m)
-    q1_ma = phi1P_ma * ((Kp1 + Kd + Kf) / Kp1)
-    phi2P_ma = JP680_ma / (Q * a2_m)
-    q2_ma = 1 - CB6F_ma / CB6F_m
-
-    Kn2_ma = (
-        (
-            Kp2**2 * phi2P_ma**2
-            - 2 * Kp2**2 * phi2P_ma * q2_ma
-            + Kp2**2 * q2_ma**2
-            - 4 * Kp2 * Ku2 * phi2P_ma**2 * q2_ma
-            + 2 * Kp2 * Ku2 * phi2P_ma**2
-            + 2 * Kp2 * Ku2 * phi2P_ma * q2_ma
-            + Ku2**2 * phi2P_ma**2
-        ) ** (1 / 2)
-        - Kp2 * phi2P_ma
-        + Ku2 * phi2P_ma
-        + Kp2 * q2_ma
-    ) / (2 * phi2P_ma) - Kf - Ku2 - Kd
-
-    if _matlab_truth(Vpmax_m == 0):
-        CB6F_s = 0
-        RUB_s = 0
-        CB6F_sa = 0
-        phi1P_sa = 0
-        q1_sa = 0
-        phi2P_sa = 0
-        q2_sa = 0
-        Kn2_sa = 0
-
-    if _matlab_truth(Vcmax_s > 0):
-        CB6F_s = CB6F * vq_frac
-        RUB_s = RUB * vc_frac
-        CB6F_sa = JP700_sjj / kq
-        phi1P_sa = JP700_sa / (Q * a1_s)
-        q1_sa = phi1P_sa * ((Kp1 + Kd + Kf) / Kp1)
-        phi2P_sa = JP680_sa / (Q * a2_s)
-        q2_sa = 1 - CB6F_sa / CB6F_s
-
-        Kn2_sa = (
-            (
-                Kp2**2 * phi2P_sa**2
-                - 2 * Kp2**2 * phi2P_sa * q2_sa
-                + Kp2**2 * q2_sa**2
-                - 4 * Kp2 * Ku2 * phi2P_sa**2 * q2_sa
-                + 2 * Kp2 * Ku2 * phi2P_sa**2
-                + 2 * Kp2 * Ku2 * phi2P_sa * q2_sa
-                + Ku2**2 * phi2P_sa**2
-            ) ** (1 / 2)
-            - Kp2 * phi2P_sa
-            + Ku2 * phi2P_sa
-            + Kp2 * q2_sa
-        ) / (2 * phi2P_sa) - Kf - Ku2 - Kd
-
-    phi2p_ma = q2_ma * Kp2 / (Kp2 + Kn2_ma + Kd + Kf + Ku2)
-    phi2n_ma = q2_ma * Kn2_ma / (Kp2 + Kn2_ma + Kd + Kf + Ku2) + (1 - q2_ma) * Kn2_ma / (Kn2_ma + Kd + Kf + Ku2)
-    phi2d_ma = q2_ma * Kd / (Kp2 + Kn2_ma + Kd + Kf + Ku2) + (1 - q2_ma) * Kd / (Kn2_ma + Kd + Kf + Ku2)
-    phi2f_ma = q2_ma * Kf / (Kp2 + Kn2_ma + Kd + Kf + Ku2) + (1 - q2_ma) * Kf / (Kn2_ma + Kd + Kf + Ku2)
-    phi2u_ma = q2_ma * Ku2 / (Kp2 + Kn2_ma + Kd + Kf + Ku2) + (1 - q2_ma) * Ku2 / (Kn2_ma + Kd + Kf + Ku2)
-    phi2P_ma = phi2p_ma / (1 - phi2u_ma)
-    phi2N_ma = phi2n_ma / (1 - phi2u_ma)
-    phi2D_ma = phi2d_ma / (1 - phi2u_ma)
-    phi2F_ma = phi2f_ma / (1 - phi2u_ma)
-
-    phi1P_ma = q1_ma * Kp1 / (Kp1 + Kd + Kf)
-    phi1N_ma = (1 - q1_ma) * Kn1 / (Kn1 + Kd + Kf)
-    phi1D_ma = q1_ma * Kd / (Kp1 + Kd + Kf) + (1 - q1_ma) * Kd / (Kn1 + Kd + Kf)
-    phi1F_ma = q1_ma * Kf / (Kp1 + Kd + Kf) + (1 - q1_ma) * Kf / (Kn1 + Kd + Kf)
-
-    phi2p_sa = q2_sa * Kp2 / (Kp2 + Kn2_sa + Kd + Kf + Ku2)
-    phi2n_sa = q2_sa * Kn2_sa / (Kp2 + Kn2_sa + Kd + Kf + Ku2) + (1 - q2_sa) * Kn2_sa / (Kn2_sa + Kd + Kf + Ku2)
-    phi2d_sa = q2_sa * Kd / (Kp2 + Kn2_sa + Kd + Kf + Ku2) + (1 - q2_sa) * Kd / (Kn2_sa + Kd + Kf + Ku2)
-    phi2f_sa = q2_sa * Kf / (Kp2 + Kn2_sa + Kd + Kf + Ku2) + (1 - q2_sa) * Kf / (Kn2_sa + Kd + Kf + Ku2)
-    phi2u_sa = q2_sa * Ku2 / (Kp2 + Kn2_sa + Kd + Kf + Ku2) + (1 - q2_sa) * Ku2 / (Kn2_sa + Kd + Kf + Ku2)
-    phi2P_sa = phi2p_sa / (1 - phi2u_sa)
-    phi2N_sa = phi2n_sa / (1 - phi2u_sa)
-    phi2D_sa = phi2d_sa / (1 - phi2u_sa)
-    phi2F_sa = phi2f_sa / (1 - phi2u_sa)
-
-    phi1P_sa = q1_sa * Kp1 / (Kp1 + Kd + Kf)
-    phi1N_sa = (1 - q1_sa) * Kn1 / (Kn1 + Kd + Kf)
-    phi1D_sa = q1_sa * Kd / (Kp1 + Kd + Kf) + (1 - q1_sa) * Kd / (Kn1 + Kd + Kf)
-    phi1F_sa = q1_sa * Kf / (Kp1 + Kd + Kf) + (1 - q1_sa) * Kf / (Kn1 + Kd + Kf)
-
-    Fs_ma = a2_m * phi2F_ma * eps2 + a1_m * phi1F_ma * eps1
-    Fm_ma = a2_m * Kf / (Kd + Kf) * eps2 + a1_m * Kf / (Kn1 + Kd + Kf) * eps1
-    Fo_ma = a2_m * Kf / (Kp2 + Kd + Kf) * eps2 + a1_m * Kf / (Kp1 + Kd + Kf) * eps1
-    Fmp_ma = a2_m * Kf / (Kn2_ma + Kd + Kf) * eps2 + a1_m * Kf / (Kn1 + Kd + Kf) * eps1
-    Fop_ma = a2_m * Kf / (Kp2 + Kn2_ma + Kd + Kf) * eps2 + a1_m * Kf / (Kp1 + Kd + Kf) * eps1
-
-    Fs_sa = a2_s * phi2F_sa * eps2 + a1_s * phi1F_sa * eps1
-    Fm_sa = a2_s * Kf / (Kd + Kf) * eps2 + a1_s * Kf / (Kn1 + Kd + Kf) * eps1
-    Fo_sa = a2_s * Kf / (Kp2 + Kd + Kf) * eps2 + a1_s * Kf / (Kp1 + Kd + Kf) * eps1
-    Fmp_sa = a2_s * Kf / (Kn2_sa + Kd + Kf) * eps2 + a1_s * Kf / (Kn1 + Kd + Kf) * eps1
-    Fop_sa = a2_s * Kf / (Kp2 + Kn2_sa + Kd + Kf) * eps2 + a1_s * Kf / (Kp1 + Kd + Kf) * eps1
-
-    Fs_a = Fs_ma + Fs_sa
-    Fm_a = Fm_ma + Fm_sa
-    Fo_a = Fo_ma + Fo_sa
-    Fmp_a = Fmp_ma + Fmp_sa
-    Fop_a = Fop_ma + Fop_sa
-
-    PAM1_a = (Fmp_a - Fs_a) / (Fmp_a - Fop_a)
-    PAM2_a = (Fmp_a - Fs_a) * Fop_a / ((Fmp_a - Fop_a) * Fs_a)
-    PAM3_a = Fm_a / Fmp_a - 1
-    PAM4_a = 1 - Fs_a / Fmp_a
-    PAM5_a = Fs_a * (1 / Fmp_a - 1 / Fm_a)
-    PAM6_a = Fs_a / Fm_a
-
-    return workspace2struct_fun(
-        exclude={
-            "v",
-            "Abs",
-            "CB6F",
-            "RUB",
-            "Rdsc",
-            "Kf",
-            "Kd",
-            "Kp1",
-            "Kn1",
-            "Kp2",
-            "Ku2",
-            "kq",
-            "nl",
-            "nc",
-            "kc",
-            "ko",
-            "Kc",
-            "Ko",
-            "c3c4_solve_cc",
-            "c3c4_solve_cj",
-            "c3c4_solve_jc",
-            "c3c4_solve_jj",
-            "c4_solve_cc",
-            "c4_solve_cj",
-            "c4_solve_jc",
-            "c4_solve_jj",
-            "eps1",
-            "eps2",
-        }
-    )
+    return pathway_model_fun(v)

@@ -71,8 +71,8 @@ def main():
     currdir = REPO_DIR
     resultsdir = OUTPUT_DIR
 
-    pathway_opt = args.pathway
-    outputname = f"Example1-Light-{pathway_opt}"
+    pathway_option = args.pathway
+    outputname = f"Example1-Light-{pathway_option}"
     outputdir = resultsdir / f"{outputname}{args.output_suffix}"
     outputdir.mkdir(parents=True, exist_ok=True)
 
@@ -80,52 +80,52 @@ def main():
     data = _build_example1_data(n)
 
     v = configure_fun(data)
-    v.Ku2 = 2e09
+    v.k_U2 = 2e09
 
-    if pathway_opt == "C3":
-        v.CB6F = 175.0 / v.kq * 1e-06
-        v.RUB = 50.0 / v.kc * 1e-06
-        v.abs_frac = 0.0
-        v.vq_frac = 0.0
-        v.vc_frac = 0.0
-        v.a2_s_frac = 0.0
-        v.a2_m_frac = 0.52
+    if pathway_option == "C3":
+        v.Cytbf_density = 175.0 / v.k_q * 1e-06
+        v.Rubisco_density = 50.0 / v.k_cat_CO2 * 1e-06
+        v.Abs_fraction_s = 0.0
+        v.Cytbf_fraction_s = 0.0
+        v.Rubisco_fraction_s = 0.0
+        v.PSII_fraction_s = 0.0
+        v.PSII_fraction = 0.52
 
-    if pathway_opt == "Type-I-C3-C4":
-        ss = symsolver_c3c4_fun(pathway_opt)
-        v.CB6F = 175.0 / v.kq * 1e-06
-        v.RUB = 50.0 / v.kc * 1e-06
-        v.abs_frac = 0.05
-        v.vq_frac = 0.05
-        v.vc_frac = 0.1
-        v.a2_s_frac = 0.52
-        v.a2_m_frac = 0.52
+    if pathway_option == "Type-I-C3-C4":
+        ss = symsolver_c3c4_fun(pathway_option)
+        v.Cytbf_density = 175.0 / v.k_q * 1e-06
+        v.Rubisco_density = 50.0 / v.k_cat_CO2 * 1e-06
+        v.Abs_fraction_s = 0.05
+        v.Cytbf_fraction_s = 0.05
+        v.Rubisco_fraction_s = 0.1
+        v.PSII_fraction_s = 0.52
+        v.PSII_fraction = 0.52
 
-    if pathway_opt == "NADP-ME-C4":
-        ss = symsolver_c3c4_fun(pathway_opt)
-        v.CB6F = 175.0 / v.kq * 1e-06
-        v.RUB = 30.0 / v.kc * 1e-06
-        v.Vpmax = v.RUB * v.kc * 2
-        v.abs_frac = 0.4
-        v.vq_frac = 0.4
-        v.vc_frac = 1
-        v.a2_s_frac = 0.47
-        v.a2_m_frac = 0.47
+    if pathway_option == "NADP-ME-C4":
+        ss = symsolver_c3c4_fun(pathway_option)
+        v.Cytbf_density = 175.0 / v.k_q * 1e-06
+        v.Rubisco_density = 30.0 / v.k_cat_CO2 * 1e-06
+        v.V_p_max = v.Rubisco_density * v.k_cat_CO2 * 2
+        v.Abs_fraction_s = 0.4
+        v.Cytbf_fraction_s = 0.4
+        v.Rubisco_fraction_s = 1
+        v.PSII_fraction_s = 0.47
+        v.PSII_fraction = 0.47
 
     v.Model_id = "model_fun_c3c4"
-    v.pathway_opt = pathway_opt
+    v.pathway_option = pathway_option
 
-    if pathway_opt == "Type-I-C3-C4":
-        v.c3c4_solve_cc = ss.c3c4_solve_cc
-        v.c3c4_solve_cj = ss.c3c4_solve_cj
-        v.c3c4_solve_jc = ss.c3c4_solve_jc
-        v.c3c4_solve_jj = ss.c3c4_solve_jj
+    if pathway_option == "Type-I-C3-C4":
+        v.solve_C3C4_cc = ss.solve_C3C4_cc
+        v.solve_C3C4_cj = ss.solve_C3C4_cj
+        v.solve_C3C4_jc = ss.solve_C3C4_jc
+        v.solve_C3C4_jj = ss.solve_C3C4_jj
 
-    if pathway_opt == "NADP-ME-C4":
-        v.c4_solve_cc = ss.c4_solve_cc
-        v.c4_solve_cj = ss.c4_solve_cj
-        v.c4_solve_jc = ss.c4_solve_jc
-        v.c4_solve_jj = ss.c4_solve_jj
+    if pathway_option == "NADP-ME-C4":
+        v.solve_C4_cc = ss.solve_C4_cc
+        v.solve_C4_cj = ss.solve_C4_cj
+        v.solve_C4_jc = ss.solve_C4_jc
+        v.solve_C4_jj = ss.solve_C4_jj
 
     m = model_fun_c3c4(v)
     s = plotter_forward_fun_c3c4(outputname, v, m)
