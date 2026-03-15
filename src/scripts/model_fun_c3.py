@@ -16,6 +16,62 @@ def _min_with_index(values):
     return np.min(stacked, axis=-1), np.argmin(stacked, axis=-1) + 1
 
 
+def _get_optional(v, name, default):
+    if isinstance(v, dict):
+        return v.get(name, default)
+    return getattr(v, name, default)
+
+
+def _smooth_transition(limit1, limit2, theta):
+    limit1, limit2 = np.broadcast_arrays(np.asarray(limit1, dtype=float), np.asarray(limit2, dtype=float))
+    discriminant = np.maximum((limit1 + limit2) ** 2 - 4 * theta * limit1 * limit2, 0)
+    sqrt_term = np.sqrt(discriminant)
+    root1 = ((limit1 + limit2) + sqrt_term) / (2 * theta)
+    root2 = ((limit1 + limit2) - sqrt_term) / (2 * theta)
+    return np.minimum(root1, root2)
+
+
+def _resolve_mesophyll_cross_sections(
+    absorptance,
+    psii_fraction,
+    cytbf_density,
+    ppfd,
+    eta,
+    k_q,
+    k_D,
+    k_F,
+    k_P1,
+    k_P2,
+    k_U2,
+    alpha_option,
+    solve_cross_sections,
+):
+    a_PSII = absorptance * psii_fraction
+    a_PSI = absorptance - a_PSII
+
+    if alpha_option != "dynamic" or solve_cross_sections is None:
+        return a_PSII, a_PSI
+
+    if np.all(np.asarray(absorptance, dtype=float) == 0) or np.all(np.asarray(cytbf_density, dtype=float) == 0):
+        return a_PSII, a_PSI
+
+    phi_P1_max = k_P1 / (k_P1 + k_D + k_F)
+    a_PSII = solve_cross_sections(
+        absorptance,
+        cytbf_density,
+        k_D,
+        k_F,
+        k_P2,
+        k_U2,
+        ppfd,
+        eta,
+        k_q,
+        phi_P1_max,
+    )
+    a_PSI = absorptance - a_PSII
+    return a_PSII, a_PSI
+
+
 def model_fun_c3(v):
     (
         pathway_option,
@@ -68,12 +124,20 @@ def model_fun_c3(v):
     O2_m = np.asarray(O2_m, dtype=float)
     CO2_m = np.asarray(CO2_m, dtype=float)
 
+    alpha_option = _get_optional(v, "alpha_option", "static")
+    solve_cross_sections = _get_optional(v, "solve_cross_sections", None)
+    limitation_transition = _get_optional(v, "limitation_transition", "hard")
+    theta_curvature = float(_get_optional(v, "theta_curvature", 0.95))
+    if limitation_transition not in {"hard", "smooth"}:
+        raise ValueError(
+            "model_fun_c3 expects limitation_transition to be either 'hard' or 'smooth'."
+        )
+
     Absorptance_m = Absorptance * (1 - Abs_fraction_s)
     Absorptance_s = Absorptance * Abs_fraction_s
-    a_PSII_m = Absorptance_m * PSII_fraction
-    a_PSI_m = Absorptance_m - a_PSII_m
     a_PSII_s = Absorptance_s * PSII_fraction_s
     a_PSI_s = Absorptance_s - a_PSII_s
+    Cytbf_density_m = Cytbf_density * (1 - Cytbf_fraction_s)
 
     Temp_K = Temp + 273.15
     Temp_ref_K = 25 + 273.15
@@ -103,6 +167,27 @@ def model_fun_c3(v):
     Specificity = (k_cat_CO2 / K_m_CO2) * (K_m_O2 / k_cat_O2)
     Ha = 23
     Specificity = 1 / (1 / Specificity * (np.exp(Ha / R * (1 / Temp_ref_K - 1 / Temp_K))))
+    eta = (
+        1
+        - (ATP_e_ratio_linear / ATP_e_ratio_cyclic)
+        + (3 + 7 * O2_m / (2 * Specificity * CO2_m))
+        / ((4 + 4 * O2_m / (Specificity * CO2_m)) * ATP_e_ratio_cyclic)
+    )
+    a_PSII_m, a_PSI_m = _resolve_mesophyll_cross_sections(
+        Absorptance_m,
+        PSII_fraction,
+        Cytbf_density_m,
+        PPFD,
+        eta,
+        k_q,
+        k_D,
+        k_F,
+        k_P1,
+        k_P2,
+        k_U2,
+        alpha_option,
+        solve_cross_sections,
+    )
     Ha = 59
     K_m_CO2 = K_m_CO2 * np.exp(Ha / R * (1 / Temp_ref_K - 1 / Temp_K))
     Ha = 36
@@ -127,12 +212,7 @@ def model_fun_c3(v):
         raise ValueError("model_fun_c3 expects zero bundle-sheath Rubisco capacity for the C3 pathway.")
 
     J_PSI_m_j = PPFD * V_q_max_m / (PPFD + V_q_max_m / (a_PSI_m * (k_P1 / (k_P1 + k_D + k_F))))
-    J_PSII_m_j = J_PSI_m_j / (
-        1
-        - (ATP_e_ratio_linear / ATP_e_ratio_cyclic)
-        + (3 + 7 * O2_m / (2 * Specificity * CO2_m))
-        / ((4 + 4 * O2_m / (Specificity * CO2_m)) * ATP_e_ratio_cyclic)
-    )
+    J_PSII_m_j = J_PSI_m_j / eta
     V_c_m_j = J_PSII_m_j / (4 * (1 + O2_m / (Specificity * CO2_m)))
     V_o_m_j = V_c_m_j * O2_m / (Specificity * CO2_m)
     A_gross_m_j = V_c_m_j - V_o_m_j / 2
@@ -144,12 +224,7 @@ def model_fun_c3(v):
     A_gross_m_c = V_c_m_c - V_o_m_c / 2
     A_net_m_c = A_gross_m_c - R_d_m
     J_PSII_m_c = A_gross_m_c * 4 * (1 + O2_m / (Specificity * CO2_m)) / (1 - O2_m / (2 * Specificity * CO2_m))
-    J_PSI_m_c = J_PSII_m_c * (
-        1
-        - (ATP_e_ratio_linear / ATP_e_ratio_cyclic)
-        + (3 + 7 * O2_m / (2 * Specificity * CO2_m))
-        / ((4 + 4 * O2_m / (Specificity * CO2_m)) * ATP_e_ratio_cyclic)
-    )
+    J_PSI_m_c = J_PSII_m_c * eta
     V_p_m_c = 0
     V_g_m_j = 0
     V_g_m_c = 0
@@ -206,14 +281,19 @@ def model_fun_c3(v):
     O2_s_actual = 0
     Leak_CO2_s_actual = 0
 
-    if _all_true(V_c_max_s == 0):
-        pass
+    V_g_m_actual = 0
+    V_p_m_actual = 0
 
-    J_PSI_m_actual, which_J_PSI_m = _min_with_index([J_PSI_m_j, J_PSI_m_c])
-    J_PSII_m_actual = J_PSII_m_j * (which_J_PSI_m == 1) + J_PSII_m_c * (which_J_PSI_m == 2)
-    V_g_m_actual = V_g_m_j * (which_J_PSI_m == 1) + V_g_m_c * (which_J_PSI_m == 2)
-    V_p_m_actual = V_p_m_j * (which_J_PSI_m == 1) + V_p_m_c * (which_J_PSI_m == 2)
-    A_net_m_actual = A_net_m_j * (which_J_PSI_m == 1) + A_net_m_c * (which_J_PSI_m == 2)
+    if limitation_transition == "smooth":
+        J_PSI_m_actual = _smooth_transition(J_PSI_m_j, J_PSI_m_c, theta_curvature)
+        J_PSII_m_actual = _smooth_transition(J_PSII_m_j, J_PSII_m_c, theta_curvature)
+        A_net_m_actual = _smooth_transition(A_net_m_j, A_net_m_c, theta_curvature)
+        which_J_PSI_m = np.zeros_like(J_PSI_m_actual, dtype=int)
+    else:
+        J_PSI_m_actual, which_J_PSI_m = _min_with_index([J_PSI_m_j, J_PSI_m_c])
+        J_PSII_m_actual = J_PSII_m_j * (which_J_PSI_m == 1) + J_PSII_m_c * (which_J_PSI_m == 2)
+        A_net_m_actual = A_net_m_j * (which_J_PSI_m == 1) + A_net_m_c * (which_J_PSI_m == 2)
+
     A_gross_m_actual = A_net_m_actual + R_d_m
 
     if _all_true(V_c_max_s > 0):
@@ -275,4 +355,13 @@ def model_fun_c3(v):
     model_state.update(fluorescence_outputs)
     model_state.pop("fluorescence_inputs", None)
     model_state.pop("fluorescence_outputs", None)
-    return build_model_output(model_state)
+    return build_model_output(
+        model_state,
+        exclude={
+            "alpha_option",
+            "solve_cross_sections",
+            "limitation_transition",
+            "theta_curvature",
+            "eta",
+        },
+    )
